@@ -1,0 +1,291 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Clipper — нарезка в вертикальные клипы</title>
+<style>
+:root{--bg:#e8ebf5;--ink:#181b3a;--mu:#5d6285;--card:#fff;--ac:#3a45ff;--hl:#ffd400;--line:#cfd4ea}
+@media (prefers-color-scheme:dark){:root{--bg:#12142b;--ink:#eceefb;--mu:#9aa0c8;--card:#1b1e3d;--line:#2d3263}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);font:16px/1.45 system-ui,-apple-system,sans-serif;padding:18px;max-width:620px;margin-inline:auto}
+h1{font-size:30px;line-height:1;margin:6px 0 4px;font-weight:900;letter-spacing:-.02em}
+.sub{color:var(--mu);margin:0 0 16px;max-width:46ch}
+.card{background:var(--card);border-radius:12px;padding:14px;margin:12px 0;border:1px solid var(--line)}
+label{display:block;font-size:13px;color:var(--mu);margin:12px 0 4px}
+label:first-child{margin-top:0}
+input,select{width:100%;padding:11px;border-radius:8px;border:1px solid var(--line);background:transparent;color:var(--ink);font:inherit}
+input:focus-visible,select:focus-visible,button:focus-visible{outline:3px solid var(--ac);outline-offset:2px}
+.row{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+button{width:100%;margin-top:14px;padding:14px;border:0;border-radius:8px;background:var(--ac);color:#fff;font:inherit;font-weight:800}
+button:disabled{opacity:.5}
+.steps{display:flex;gap:4px;margin-bottom:10px}
+.steps span{flex:1;text-align:center;font-size:12px;padding:6px 0;border-radius:6px;background:var(--bg);color:var(--mu)}
+.steps span.on{background:var(--hl);color:#000;font-weight:700}
+.steps span.ok{background:var(--ac);color:#fff}
+progress{width:100%;height:8px;accent-color:var(--ac)}
+#log{font:12px ui-monospace,monospace;color:var(--mu);white-space:pre-wrap;max-height:150px;overflow:auto;margin-top:8px}
+.clip video{width:100%;border-radius:8px;background:#000;max-height:70vh}
+.clip a{display:block;text-align:center;padding:10px;font-weight:700;color:var(--ac)}
+.note{font-size:13px;color:var(--mu)}
+</style>
+</head>
+<body>
+<h1>Clipper</h1>
+<p class="sub">Нарезает видео на вертикальные клипы: сверху момент из видео, снизу геймплей, по центру субтитры. Всё считается на твоём устройстве.</p>
+
+<div class="card">
+  <label for="src">Видео или стрим</label>
+  <input type="file" id="src" accept="video/*">
+  <label for="game">Геймплей для нижней части</label>
+  <input type="file" id="game" accept="video/*">
+  <div class="row">
+    <div><label for="ad">Рекламное видео (необязательно)</label><input type="file" id="ad" accept="video/*"></div>
+    <div><label for="adpos">Вставить на, % клипа</label><input id="adpos" type="number" value="50" min="5" max="95"></div>
+  </div>
+  <div class="row">
+    <div><label for="len">Длина клипа, сек</label><input id="len" type="number" value="40" min="10" max="90"></div>
+    <div><label for="cnt">Сколько клипов</label><input id="cnt" type="number" value="3" min="1" max="10"></div>
+  </div>
+  <div class="row">
+    <div><label for="lang">Язык речи</label>
+      <select id="lang"><option value="russian">Русский</option><option value="english">English</option><option value="">Авто</option></select></div>
+    <div><label for="model">Модель Whisper</label>
+      <select id="model"><option value="Xenova/whisper-tiny">tiny — быстро</option><option value="Xenova/whisper-base" selected>base — точнее</option></select></div>
+  </div>
+  <label for="key">Ключ Claude API (необязательно: умный выбор моментов)</label>
+  <input id="key" type="password" placeholder="sk-ant-…" autocomplete="off">
+  <button id="go">Нарезать</button>
+  <p class="note">Не сворачивай вкладку и не блокируй экран, пока идёт рендер: клип записывается в реальном времени.</p>
+</div>
+
+<div class="card">
+  <div class="steps"><span id="s1">Звук</span><span id="s2">Речь</span><span id="s3">Моменты</span><span id="s4">Рендер</span></div>
+  <progress id="pr" value="0" max="1"></progress>
+  <div id="log" aria-live="polite"></div>
+</div>
+<div id="out"></div>
+
+<script type="module">
+import { pipeline } from 'https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.5.1';
+
+const $ = id => document.getElementById(id);
+const log = m => { const l = $('log'); l.textContent += m + '\n'; l.scrollTop = 1e9; };
+const step = n => { for (let i = 1; i <= 4; i++) $('s' + i).className = i < n ? 'ok' : i === n ? 'on' : ''; };
+const once = (el, ev) => new Promise(r => el.addEventListener(ev, r, { once: true }));
+const W = 540, H = 960;
+const vs = document.createElement('video'), vg = document.createElement('video'), va = document.createElement('video');
+vs.preload = vg.preload = va.preload = 'auto';
+vs.playsInline = vg.playsInline = va.playsInline = true;
+let ac, dest;
+const routed = new WeakSet();
+function route(el) { // createMediaElementSource можно вызвать для элемента только один раз
+  if (routed.has(el)) return;
+  routed.add(el); ac.createMediaElementSource(el).connect(dest);
+}
+vg.muted = true; vg.loop = true;
+
+async function seek(v, t) {
+  if (Math.abs(v.currentTime - t) < 0.02) return;
+  v.currentTime = t;
+  await once(v, 'seeked');
+}
+
+// ---- 1. звук -> 16 кГц моно ----
+async function decodeAudio(file) {
+  const ctx = new AudioContext({ sampleRate: 16000 });
+  const buf = await ctx.decodeAudioData(await file.arrayBuffer());
+  ctx.close();
+  return buf.getChannelData(0);
+}
+
+// ---- 2. Whisper в браузере (пословные таймкоды) ----
+async function transcribe(audio) {
+  let asr;
+  const devices = navigator.gpu ? ['webgpu', 'wasm'] : ['wasm'];
+  for (const device of devices) {
+    try {
+      log(`Загружаю модель (${device})… первый раз долго, дальше из кэша`);
+      asr = await pipeline('automatic-speech-recognition', $('model').value, {
+        device,
+        progress_callback: p => { if (p.status === 'progress') $('pr').value = p.progress / 100; }
+      });
+      break;
+    } catch (e) { log('Не вышло на ' + device + ': ' + e.message); }
+  }
+  if (!asr) throw new Error('Не удалось загрузить Whisper');
+  log('Распознаю речь…');
+  const o = { return_timestamps: 'word', chunk_length_s: 30, stride_length_s: 5 };
+  if ($('lang').value) { o.language = $('lang').value; o.task = 'transcribe'; }
+  const r = await asr(audio, o);
+  return r.chunks
+    .map(c => ({ w: c.text.trim(), s: c.timestamp[0], e: c.timestamp[1] ?? c.timestamp[0] + 0.3 }))
+    .filter(x => x.w && x.s != null);
+}
+
+// ---- 3. выбор моментов ----
+function pickFixed(words, len, n) {
+  const clips = []; let i = 0;
+  while (i < words.length && clips.length < n) {
+    const s = words[i].s; let j = i;
+    while (j < words.length - 1 && words[j].e - s < len) j++;
+    while (j < words.length - 1 && words[j].e - s < len + 15 && !/[.!?…]$/.test(words[j].w)) j++;
+    if (words[j].e - s >= 8) clips.push({ s, e: words[j].e });
+    i = j + 1;
+  }
+  return clips;
+}
+
+async function pickAI(words, len, n) {
+  const lines = []; let cur = '', t0 = 0;
+  for (const x of words) {
+    if (x.s - t0 > 8 && cur) { lines.push(`[${t0.toFixed(0)}] ${cur}`); cur = ''; t0 = x.s; }
+    cur += x.w + ' ';
+  }
+  lines.push(`[${t0.toFixed(0)}] ${cur}`);
+  const r = await fetch('https://api.anthropic.com/v1/messages', {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      'x-api-key': $('key').value.trim(),
+      'anthropic-version': '2023-06-01',
+      'anthropic-dangerous-direct-browser-access': 'true'
+    },
+    body: JSON.stringify({
+      model: 'claude-sonnet-5-5', max_tokens: 1500,
+      messages: [{ role: 'user', content:
+        `Транскрипт с таймкодами в секундах. Выбери ${n} самых цепляющих моментов для коротких клипов длиной около ${len} сек (допустимо ±15), законченных по смыслу. Ответь ТОЛЬКО JSON: [{"s":число,"e":число}]\n\n` +
+        lines.join('\n').slice(0, 150000) }]
+    })
+  });
+  if (!r.ok) throw new Error('API ' + r.status);
+  const d = await r.json();
+  return JSON.parse(d.content.map(c => c.text || '').join('').replace(/```json|```/g, '').trim())
+    .filter(c => c.e > c.s).slice(0, n);
+}
+
+// ---- 4. рендер: canvas + MediaRecorder ----
+function cover(c, v, x, y, w, h) {
+  const r = Math.max(w / v.videoWidth, h / v.videoHeight), sw = w / r, sh = h / r;
+  c.drawImage(v, (v.videoWidth - sw) / 2, (v.videoHeight - sh) / 2, sw, sh, x, y, w, h);
+}
+
+function drawSubs(c, cw, t) {
+  let k = cw.findIndex(x => x.s <= t && t < x.e + 0.25);
+  if (k < 0) { k = cw.findLastIndex(x => x.s <= t); if (k < 0 || t - cw[k].e > 1) return; }
+  const g = Math.floor(k / 3) * 3, ch = cw.slice(g, g + 3).map(x => x.w.toUpperCase());
+  let size = W * 0.085, ws, sp, tot;
+  const measure = () => {
+    c.font = `900 ${size}px "Arial Black",Arial,sans-serif`;
+    sp = c.measureText(' ').width * 1.2;
+    ws = ch.map(s => c.measureText(s).width);
+    tot = ws.reduce((a, b) => a + b, 0) + sp * (ch.length - 1);
+  };
+  measure();
+  if (tot > W * 0.92) { size *= W * 0.92 / tot; measure(); }
+  c.textAlign = 'left'; c.textBaseline = 'middle'; c.lineJoin = 'round';
+  c.lineWidth = size * 0.22; c.strokeStyle = '#000';
+  let x = (W - tot) / 2;
+  ch.forEach((s, i) => {
+    c.strokeText(s, x, H / 2); c.fillStyle = (g + i === k) ? '#ffd400' : '#fff'; c.fillText(s, x, H / 2);
+    x += ws[i] + sp;
+  });
+}
+
+async function render(clip, words, dest) {
+  const cv = document.createElement('canvas'); cv.width = W; cv.height = H;
+  const c = cv.getContext('2d');
+  const cw = words.filter(x => x.s >= clip.s - 0.05 && x.e <= clip.e + 0.3);
+  await seek(vs, clip.s);
+  await seek(vg, Math.random() * Math.max(0, vg.duration - (clip.e - clip.s) - 5));
+  const stream = cv.captureStream(30);
+  dest.stream.getAudioTracks().forEach(t => stream.addTrack(t));
+  const mime = ['video/mp4;codecs=avc1,mp4a.40.2', 'video/webm;codecs=vp9,opus', 'video/webm']
+    .find(m => MediaRecorder.isTypeSupported(m));
+  const rec = new MediaRecorder(stream, { mimeType: mime, videoBitsPerSecond: 4e6 });
+  const chunks = []; rec.ondataavailable = e => chunks.push(e.data);
+  const stopped = new Promise(r => rec.onstop = r);
+  // реклама: на указанной доле клипа (после конца ближайшего слова) основное видео и геймплей встают на паузу, реклама идёт поверх
+  const hasAd = !!$('ad').files[0];
+  const pos = clip.s + (clip.e - clip.s) * (+$('adpos').value || 50) / 100;
+  const mid = (cw.find(x => x.e >= pos) || { e: pos }).e;
+  let phase = 0; // 0 — до рекламы, 1 — реклама, 2 — после
+  rec.start(); await vs.play(); vg.play();
+  await new Promise(done => {
+    const frame = () => {
+      const t = vs.currentTime;
+      if (phase === 1) {
+        // замершие кадры основного видео и геймплея остаются фоном, реклама — 75% экрана по центру
+        cover(c, vs, 0, 0, W, H / 2); cover(c, vg, 0, H / 2, W, H / 2);
+        c.fillStyle = 'rgba(0,0,0,.45)'; c.fillRect(0, 0, W, H);
+        const aw = W * 0.75, ah = H * 0.75, ax = (W - aw) / 2, ay = (H - ah) / 2;
+        c.save(); c.beginPath(); c.rect(ax, ay, aw, ah); c.clip();
+        cover(c, va, ax, ay, aw, ah);
+        c.restore();
+        $('pr').value = Math.min(1, va.currentTime / (va.duration || 1));
+      } else {
+        cover(c, vs, 0, 0, W, H / 2); cover(c, vg, 0, H / 2, W, H / 2);
+        drawSubs(c, cw, t);
+        $('pr').value = Math.min(1, (t - clip.s) / (clip.e - clip.s));
+        if (hasAd && phase === 0 && t >= mid) {
+          phase = 1; vs.pause(); vg.pause();
+          va.onended = () => { phase = 2; vs.play(); vg.play(); };
+          va.currentTime = 0; va.play();
+        }
+      }
+      if (phase !== 1 && (t >= clip.e || vs.ended)) return done();
+      requestAnimationFrame(frame);
+    };
+    frame();
+  });
+  va.onended = null; va.pause(); vs.pause(); vg.pause(); rec.stop(); await stopped;
+  return { blob: new Blob(chunks, { type: mime.split(';')[0] }), ext: mime.startsWith('video/mp4') ? 'mp4' : 'webm' };
+}
+
+// ---- запуск ----
+$('go').onclick = async () => {
+  const sf = $('src').files[0], gf = $('game').files[0];
+  if (!sf || !gf) return log('Выбери оба файла: видео и геймплей.');
+  $('go').disabled = true; $('out').innerHTML = ''; $('log').textContent = '';
+  try {
+    if (!ac) { ac = new AudioContext(); dest = ac.createMediaStreamDestination(); }
+    await ac.resume();
+    const af = $('ad').files[0];
+    vs.src = URL.createObjectURL(sf); vg.src = URL.createObjectURL(gf);
+    if (af) va.src = URL.createObjectURL(af);
+    await Promise.all([once(vs, 'loadedmetadata'), once(vg, 'loadedmetadata'), ...(af ? [once(va, 'loadedmetadata')] : [])]);
+    route(vs); if (af) route(va);
+
+    step(1); log('Извлекаю звук…');
+    const audio = await decodeAudio(sf);
+    step(2); const words = await transcribe(audio);
+    if (!words.length) throw new Error('Речь не распознана');
+    log(`Распознано слов: ${words.length}`);
+
+    step(3);
+    const len = +$('len').value, n = +$('cnt').value;
+    let clips;
+    if ($('key').value.trim()) {
+      try { clips = await pickAI(words, len, n); }
+      catch (e) { log('Claude не ответил (' + e.message + '), режу по длине'); }
+    }
+    clips = clips || pickFixed(words, len, n);
+    if (!clips.length) throw new Error('Не нашёл подходящих моментов');
+    log(`Клипов: ${clips.length}`);
+
+    step(4);
+    for (let i = 0; i < clips.length; i++) {
+      log(`Рендерю клип ${i + 1} из ${clips.length} (${(clips[i].e - clips[i].s).toFixed(0)} сек)…`);
+      const { blob, ext } = await render(clips[i], words, dest);
+      const url = URL.createObjectURL(blob);
+      const d = document.createElement('div'); d.className = 'card clip';
+      d.innerHTML = `<video controls playsinline src="${url}"></video><a href="${url}" download="clip${i + 1}.${ext}">Скачать клип ${i + 1}</a>`;
+      $('out').append(d);
+    }
+    step(5); log('Готово.');
+  } catch (e) { log('Ошибка: ' + e.message); }
+  finally { $('go').disabled = false; }
+};
+</script>
+</body>
+</html>
